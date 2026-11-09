@@ -1,0 +1,428 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          mkdir -p src/main/java/com/cybershield/app
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "CyberShield"
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2"
+              id("org.jetbrains.kotlin.android") version "1.9.24"
+          }
+          android {
+              namespace = "com.cybershield.app"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.cybershield.app"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 2
+                  versionName = "0.2"
+              }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          cat > src/main/AndroidManifest.xml <<'EOF_FILE'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET"/>
+            <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+            <application android:label="CyberShield" android:theme="@android:style/Theme.Material.NoActionBar">
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+              <service android:name=".ShieldCallScreening" android:exported="true"
+                  android:permission="android.permission.BIND_SCREENING_SERVICE">
+                <intent-filter><action android:name="android.telecom.CallScreeningService"/></intent-filter>
+              </service>
+              <service android:name=".MessageWatcher" android:exported="true"
+                  android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                <intent-filter><action android:name="android.service.notification.NotificationListenerService"/></intent-filter>
+              </service>
+            </application>
+          </manifest>
+          EOF_FILE
+          cat > src/main/java/com/cybershield/app/MainActivity.kt <<'EOF_FILE'
+          package com.cybershield.app
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.role.RoleManager
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+          import android.telecom.Call
+          import android.telecom.CallScreeningService
+          import android.view.View
+          import android.widget.*
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URI
+          import java.net.URL
+          import java.net.URLEncoder
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import kotlin.concurrent.thread
+
+          fun mask(t: String) = t.replace(Regex("[\\w.+-]+@[\\w-]+\\.[\\w.-]+"), "[EMAIL]")
+              .replace(Regex("\\b(otp|pin|code|cvv)\\b[^\\d]{0,12}\\d{3,8}", RegexOption.IGNORE_CASE), "$1 [CODE]")
+              .replace(Regex("\\+?\\d[\\d\\s().-]{7,}\\d"), "[NUMBER]")
+
+          /** On-device scam rules. Estimates only. */
+          object Scam {
+              class R(val re: Regex, val w: Int, val name: String, val cat: String)
+              class Res(val level: String, val cat: String, val why: List<String>)
+              private val I = RegexOption.IGNORE_CASE
+              private val rules = listOf(
+                  R(Regex("\\b(urgent|immediately|act now|final notice|expires? today)\\b", I), 2, "Urgency pressure", "Pressure scam"),
+                  R(Regex("\\b(otp|one[- ]time (password|code)|pin|cvv|password)\\b", I), 3, "Asks for a secret code", "Credential theft"),
+                  R(Regex("\\b(kyc|account (is |will be )?(suspended|blocked|locked)|verify your (account|identity))\\b", I), 3, "Account threat", "Possible phishing"),
+                  R(Regex("\\b(you (have )?won|lottery|prize|claim your (reward|gift))\\b", I), 3, "Fake reward", "Prize scam"),
+                  R(Regex("\\b(gift ?cards?|bitcoin|crypto|wire transfer|processing fee)\\b", I), 3, "Unusual payment request", "Payment scam"),
+                  R(Regex("\\b(click (here|the link)|bit\\.ly|tinyurl\\.com|cutt\\.ly)\\S*", I), 2, "Suspicious link prompt", "Possible phishing"),
+                  R(Regex("\\b(arrest|legal action|parcel (is )?held|delivery (failed|fee))\\b", I), 2, "Threat or impersonation", "Impersonation")
+              )
+              fun analyse(t: String): Res {
+                  var s = 0; val why = mutableListOf<String>(); var best: R? = null
+                  for (r in rules) if (r.re.containsMatchIn(t)) { s += r.w; why += r.name; if (best == null || r.w > best.w) best = r }
+                  return Res(if (s >= 6) "HIGH" else if (s >= 3) "MEDIUM" else "LOW", best?.cat ?: "No known pattern", why)
+              }
+              fun linkFlags(raw: String): List<String>? {
+                  var v = raw.trim()
+                  if (!Regex("^[a-z]+://", I).containsMatchIn(v)) v = "http://$v"
+                  val u = try { URI(v) } catch (e: Exception) { return null }
+                  val h = (u.host ?: return null).lowercase()
+                  val f = mutableListOf<String>()
+                  if (raw.trim().startsWith("http://", true)) f += "Not using HTTPS"
+                  if (Regex("^\\d{1,3}(\\.\\d{1,3}){3}$").matches(h)) f += "Address is an IP number"
+                  if ("xn--" in h) f += "Possible lookalike (punycode) domain"
+                  if (u.userInfo != null) f += "Uses @ to disguise the destination"
+                  if (h.split(".").size > 4) f += "Many subdomains"
+                  if (h.substringAfterLast('.') in setOf("zip", "xyz", "top", "click", "work", "loan", "tk", "icu", "buzz")) f += "Domain ending often abused"
+                  if (h.count { it == '-' } >= 3) f += "Many hyphens in domain"
+                  if (h in setOf("bit.ly", "tinyurl.com", "t.co", "goo.gl", "is.gd", "cutt.ly")) f += "URL shortener hides the destination"
+                  if (listOf("login", "verify", "secure", "kyc", "bank", "wallet").any { it in h }) f += "Sensitive keyword in domain"
+                  if (v.length > 120) f += "Very long URL"
+                  return f
+              }
+          }
+
+          object Net {
+              /** Your deployed backend, https only. Blank = offline mode (on-device rules only). */
+              const val BASE_URL = ""
+              fun call(method: String, path: String, body: JSONObject? = null): JSONObject? {
+                  if (BASE_URL.isBlank()) return null
+                  return try {
+                      val c = URL(BASE_URL + path).openConnection() as HttpURLConnection
+                      c.requestMethod = method; c.connectTimeout = 8000; c.readTimeout = 20000
+                      if (body != null) {
+                          c.doOutput = true; c.setRequestProperty("Content-Type", "application/json")
+                          c.outputStream.use { it.write(body.toString().toByteArray()) }
+                      }
+                      if (c.responseCode in 200..299) JSONObject(c.inputStream.bufferedReader().readText()) else null
+                  } catch (e: Exception) { null }
+              }
+              fun reportCount(n: String): Int? =
+                  call("GET", "/api/number?n=" + URLEncoder.encode(n, "UTF-8"))?.optInt("reports", -1)?.takeIf { it >= 0 }
+              fun warn(ctx: Context, title: String, text: String, id: Int) {
+                  val nm = ctx.getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("shield", "Scam warnings", NotificationManager.IMPORTANCE_HIGH))
+                  nm.notify(id, Notification.Builder(ctx, "shield").setSmallIcon(android.R.drawable.ic_dialog_alert)
+                      .setContentTitle(title).setContentText(text).setStyle(Notification.BigTextStyle().bigText(text)).build())
+              }
+          }
+
+          object Hist {
+              private fun p(c: Context) = c.getSharedPreferences("hist", 0)
+              fun add(c: Context, kind: String, cat: String, level: String) {
+                  val a = JSONArray(p(c).getString("a", "[]"))
+                  a.put(JSONObject().put("k", kind).put("c", cat).put("l", level)
+                      .put("d", SimpleDateFormat("dd MMM yyyy HH:mm", Locale.getDefault()).format(Date())))
+                  p(c).edit().putString("a", a.toString()).apply()
+              }
+              fun all(c: Context): JSONArray = JSONArray(p(c).getString("a", "[]"))
+              fun clear(c: Context) = p(c).edit().clear().apply()
+          }
+
+          class ShieldCallScreening : CallScreeningService() {
+              override fun onScreenCall(details: Call.Details) {
+                  val number = details.handle?.schemeSpecificPart.orEmpty()
+                  thread {
+                      val n = if (number.isNotBlank()) Net.reportCount(number) else null
+                      if (n != null && n > 0)
+                          Net.warn(this, "Possible scam call", "$number has $n user report(s). Reports are not confirmed.", number.hashCode())
+                      respondToCall(details, CallResponse.Builder().build())
+                  }
+              }
+          }
+
+          class MessageWatcher : NotificationListenerService() {
+              private val watched = setOf("com.google.android.apps.messaging", "com.samsung.android.messaging", "com.whatsapp")
+              override fun onNotificationPosted(sbn: StatusBarNotification) {
+                  if (sbn.packageName !in watched) return
+                  val text = sbn.notification.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: return
+                  val r = Scam.analyse(text)
+                  if (r.level != "LOW") {
+                      Net.warn(this, "Possible scam message (${r.level})", r.why.joinToString(", ") + ". Do not click links or share codes.", sbn.id)
+                      Hist.add(this, "Live message", r.cat, r.level)
+                  }
+              }
+          }
+
+          class MainActivity : Activity() {
+              private val CARD = Color.parseColor("#101A3F")
+              private val CY = Color.parseColor("#22D3EE")
+              private val MUTED = Color.parseColor("#93A0CF")
+              private lateinit var body: LinearLayout
+
+              private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
+              private fun tv(t: String, size: Float = 15f, col: Int = Color.WHITE, bold: Boolean = false) = TextView(this).apply {
+                  text = t; textSize = size; setTextColor(col); setPadding(0, dp(3), 0, dp(3))
+                  if (bold) setTypeface(typeface, android.graphics.Typeface.BOLD)
+              }
+              private fun card() = LinearLayout(this).apply {
+                  orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(12), dp(16), dp(12))
+                  background = GradientDrawable().apply { setColor(CARD); cornerRadius = dp(16).toFloat(); setStroke(dp(1), Color.parseColor("#22307A")) }
+                  layoutParams = LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, 0, 0, dp(12)) }
+              }
+              private fun btn(t: String, f: () -> Unit) = Button(this).apply {
+                  text = t; isAllCaps = false; setTextColor(Color.parseColor("#02101C"))
+                  background = GradientDrawable().apply { setColor(CY); cornerRadius = dp(12).toFloat() }
+                  setOnClickListener { f() }
+              }
+              private fun field(h: String, lines: Int) = EditText(this).apply {
+                  hint = h; minLines = lines; setTextColor(Color.WHITE); setHintTextColor(MUTED)
+                  background = GradientDrawable().apply { setColor(Color.parseColor("#050A1F")); cornerRadius = dp(10).toFloat(); setStroke(dp(1), Color.parseColor("#22307A")) }
+                  setPadding(dp(12), dp(10), dp(12), dp(10))
+              }
+              private fun riskColor(l: String) = Color.parseColor(when (l) { "HIGH" -> "#F43F5E"; "MEDIUM" -> "#FB923C"; else -> "#34D399" })
+              private fun note(into: LinearLayout, t: String) { into.removeAllViews(); into.addView(tv(t, 14f, MUTED)) }
+
+              private fun result(into: LinearLayout, level: String, cat: String, why: List<String>, extra: String, act: String) {
+                  val c = card()
+                  c.addView(tv("$level RISK", 24f, riskColor(level), true))
+                  c.addView(tv("Category: $cat", 15f, Color.WHITE, true))
+                  c.addView(tv("Warning signs:\n" + if (why.isEmpty()) "None found" else why.joinToString("\n") { "• $it" }, 14f, MUTED))
+                  if (extra.isNotEmpty()) c.addView(tv(extra, 14f, MUTED))
+                  c.addView(tv("Recommended: $act", 14f))
+                  c.addView(tv("Scanned " + SimpleDateFormat("dd MMM yyyy HH:mm", Locale.getDefault()).format(Date()) + ". Results are estimates, not proof.", 12f, MUTED))
+                  into.removeAllViews(); into.addView(c)
+              }
+              private fun advice(l: String) = when (l) {
+                  "HIGH" -> "Do not click links, reply or share codes. Verify through the organisation's official website or phone number."
+                  "MEDIUM" -> "Be careful. Verify through an official channel before acting."
+                  else -> "No known patterns matched. This does not prove it is safe."
+              }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 0)
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(Color.parseColor("#070B1F")); setPadding(0, dp(30), 0, 0) }
+                  root.addView(tv("  CyberShield", 24f, CY, true))
+                  root.addView(tv("  Detect Threats. Protect People.", 13f, MUTED))
+                  val bar = LinearLayout(this)
+                  for (t in listOf("Home", "Message", "Link", "Number", "Community", "History", "Privacy", "About"))
+                      bar.addView(Button(this).apply { text = t; isAllCaps = false; setOnClickListener { go(t) } })
+                  root.addView(HorizontalScrollView(this).apply { addView(bar) })
+                  body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(14), dp(10), dp(14), dp(30)) }
+                  root.addView(ScrollView(this).apply { addView(body) })
+                  setContentView(root)
+                  go("Home")
+              }
+
+              private fun go(s: String) {
+                  body.removeAllViews()
+                  when (s) {
+                      "Home" -> home()
+                      "Message" -> message()
+                      "Link" -> link()
+                      "Number" -> number()
+                      "Community" -> community()
+                      "History" -> history()
+                      "Privacy" -> privacy()
+                      else -> about()
+                  }
+              }
+
+              private fun enableButtons(into: LinearLayout) {
+                  into.addView(btn("Enable caller warnings") {
+                      startActivityForResult(getSystemService(RoleManager::class.java).createRequestRoleIntent(RoleManager.ROLE_CALL_SCREENING), 1)
+                  })
+                  into.addView(btn("Enable message scanning") { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) })
+              }
+
+              private fun home() {
+                  body.addView(tv("Welcome. Check messages, links and numbers before you trust them.", 16f))
+                  val c = card()
+                  val msgOn = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")?.contains(packageName) == true
+                  val callOn = getSystemService(RoleManager::class.java).isRoleHeld(RoleManager.ROLE_CALL_SCREENING)
+                  c.addView(tv("Security status", 17f, CY, true))
+                  c.addView(tv("Message scanning: " + (if (msgOn) "ON" else "OFF") + "\nCaller warnings: " + (if (callOn) "ON" else "OFF") +
+                      "\nBackend: " + (if (Net.BASE_URL.isBlank()) "not connected (offline mode)" else "configured"), 14f, MUTED))
+                  enableButtons(c); body.addView(c)
+                  for ((t, d) in listOf("Message" to "Scam Message Scanner", "Link" to "Smart Link Scanner", "Number" to "Number Intelligence", "Community" to "Community Reports")) {
+                      val k = card(); k.addView(tv(d, 17f, Color.WHITE, true)); k.addView(btn("Open") { go(t) }); body.addView(k)
+                  }
+                  val h = Hist.all(this); val r = card()
+                  r.addView(tv("Recent scans", 17f, CY, true))
+                  if (h.length() == 0) r.addView(tv("No scans yet.", 14f, MUTED))
+                  for (i in maxOf(0, h.length() - 3) until h.length()) { val o = h.getJSONObject(i); r.addView(tv("${o.getString("d")}: ${o.getString("k")}, ${o.getString("c")} (${o.getString("l")})", 13f, MUTED)) }
+                  body.addView(r)
+              }
+
+              private fun message() {
+                  val f = field("Paste an SMS, WhatsApp message or email. Never include passwords, OTPs or PINs.", 4)
+                  val out = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  body.addView(f)
+                  body.addView(btn("Analyse message") {
+                      val t = mask(f.text.toString().trim())
+                      if (t.length < 10) { note(out, "Paste at least a full sentence."); return@btn }
+                      val r = Scam.analyse(t)
+                      result(out, r.level, r.cat, r.why, "On-device rule check. Personal details were masked.", advice(r.level))
+                      Hist.add(this, "Message", r.cat, r.level)
+                      if (Net.BASE_URL.isBlank()) { out.addView(tv("AI analysis: not connected. Set BASE_URL to enable it.", 13f, MUTED)); return@btn }
+                      val ai = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                      out.addView(ai); ai.addView(tv("Asking AI service...", 13f, MUTED))
+                      thread {
+                          val j = Net.call("POST", "/api/analyze", JSONObject().put("text", t))
+                          runOnUiThread {
+                              if (j == null) note(ai, "AI service unreachable. Showing on-device result only.")
+                              else {
+                                  val a = j.optJSONArray("phrases") ?: JSONArray()
+                                  val acts = j.optJSONArray("actions") ?: JSONArray()
+                                  result(ai, j.optString("risk", "MEDIUM"), "AI estimate", (0 until a.length()).map { a.getString(it) },
+                                      j.optString("explanation"), (0 until acts.length()).joinToString(" ") { acts.getString(it) })
+                              }
+                          }
+                      }
+                  })
+                  body.addView(out)
+              }
+
+              private fun link() {
+                  val f = field("https://example.com", 1)
+                  val out = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  body.addView(f)
+                  body.addView(btn("Check link") {
+                      val u = f.text.toString().trim()
+                      val flags = Scam.linkFlags(u)
+                      if (flags == null) { note(out, "That does not look like a valid web address."); return@btn }
+                      val lvl = if (flags.size >= 3) "HIGH" else if (flags.isNotEmpty()) "MEDIUM" else "LOW"
+                      result(out, lvl, "Link structure check", flags, "The link was never opened. Reputation database: " +
+                          (if (Net.BASE_URL.isBlank()) "not connected." else "checking..."), if (lvl == "LOW") "No warning signs in the basic check. This does not mean the link is safe." else "Do not enter details. Type the official address yourself.")
+                      Hist.add(this, "Link", "Link structure check", lvl)
+                      if (Net.BASE_URL.isNotBlank()) thread {
+                          val j = Net.call("POST", "/api/link", JSONObject().put("url", u))
+                          runOnUiThread { out.addView(tv(if (j == null) "Reputation lookup failed." else if (j.optBoolean("listed")) "WARNING: listed as dangerous: " + j.optJSONArray("threats") else "Not listed in the threat database (this is not a safety guarantee).", 14f, MUTED)) }
+                      }
+                  })
+                  body.addView(out)
+              }
+
+              private fun number() {
+                  val f = field("+44 7700 900123", 1)
+                  val out = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  body.addView(f)
+                  body.addView(btn("Check number") {
+                      val n = f.text.toString().trim(); val d = n.filter { it.isDigit() }
+                      if (d.length !in 8..15) { note(out, "Enter a valid phone number (8 to 15 digits)."); return@btn }
+                      note(out, "Checking...")
+                      thread {
+                          val c = Net.reportCount(n)
+                          runOnUiThread {
+                              note(out, when {
+                                  Net.BASE_URL.isBlank() -> "Format looks valid. Report database not connected, so reports cannot be checked."
+                                  c == null -> "Could not reach the report database."
+                                  c == 0 -> "No user reports found. This does not prove the number is safe."
+                                  else -> "$c user-submitted report(s). These are community reports, not confirmed fraud."
+                              })
+                              Hist.add(this, "Number", "Number check", "LOW")
+                          }
+                      }
+                  })
+                  body.addView(out)
+              }
+
+              private fun community() {
+                  body.addView(tv("Report a scam. Details are masked before sending. Do not include passwords or OTPs.", 14f, MUTED))
+                  val num = field("Scam number (optional)", 1); val txt = field("What happened?", 3)
+                  val out = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  body.addView(num); body.addView(txt)
+                  body.addView(btn("Submit report") {
+                      if (Net.BASE_URL.isBlank()) { note(out, "Community backend not connected. Reports cannot be submitted yet."); return@btn }
+                      val j = JSONObject().put("text", mask(txt.text.toString().trim())).put("kind", "Other")
+                      if (num.text.isNotBlank()) j.put("number", num.text.toString().trim())
+                      thread {
+                          val r = Net.call("POST", "/api/report", j)
+                          runOnUiThread { note(out, if (r == null) "Submit failed. Check the details and connection." else "Submitted. Report ID ${r.optInt("id")}. Keep this delete token: ${r.optString("delete_token")}") }
+                      }
+                  })
+                  body.addView(out)
+                  body.addView(tv("Trend charts and report flagging are not built yet.", 13f, MUTED))
+              }
+
+              private fun history() {
+                  val h = Hist.all(this)
+                  if (h.length() == 0) body.addView(tv("No scans yet.", 15f, MUTED))
+                  for (i in h.length() - 1 downTo 0) {
+                      val o = h.getJSONObject(i); val c = card()
+                      c.addView(tv("${o.getString("l")}  ${o.getString("k")}", 16f, riskColor(o.getString("l")), true))
+                      c.addView(tv("${o.getString("c")}\n${o.getString("d")}", 13f, MUTED)); body.addView(c)
+                  }
+                  body.addView(btn("Delete scan history") { Hist.clear(this); go("History") })
+              }
+
+              private fun privacy() {
+                  val c = card()
+                  c.addView(tv("Privacy", 18f, CY, true))
+                  c.addView(tv("CyberShield never asks for passwords, PINs or OTPs.\nMessages are masked, then checked on your phone. They are sent to a server only if a backend is configured and you tap analyse.\nHistory keeps only the scan type, category, risk and time, never the message. You can delete it below.", 14f, MUTED))
+                  body.addView(c)
+                  enableButtons(body)
+                  body.addView(btn("Delete scan history") { Hist.clear(this); note(c, "History deleted.") })
+              }
+
+              private fun about() {
+                  val c = card()
+                  c.addView(tv("About CyberShield", 18f, CY, true))
+                  c.addView(tv("Proposed innovation project. Scores are estimates from keyword rules and, when a backend is connected, an AI service. Nothing here proves a message, link or number is safe or fraudulent. Verify through official channels.\n\nVersion 0.2", 14f, MUTED))
+                  body.addView(c)
+              }
+          }
+          EOF_FILE
+
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cybershield-apk
+          path: build/outputs/apk/debug/*.apk
